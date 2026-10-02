@@ -1,0 +1,31 @@
+[project]
+name = "open-gpt-voice"
+version = "0.1.0"
+description = "A local GPT-Live-style voice agent for real-time conversation."
+readme = "README.md"
+authors = [
+    { name = "Ali Tavallaie", email = "a.tavallaie@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "faster-whisper>=1.1,<2",
+    "gliner2>=2,<3",
+    "httpx>=0.28,<1",
+    "loguru>=0.7,<1",
+    "numpy>=2,<3",
+    "onnxruntime>=1.20,<2",
+    "supertonic>=1.3,<2",
+    "uvicorn[standard]>=0.54.0",
+    "websockets>=14,<16",
+]
+
+[project.optional-dependencies]
+laya = ["laya[onnx]>=0.3.20,<1"]
+
+[project.scripts]
+open-gpt-voice = "open_gpt_voice:main"
+
+[build-system]
+requires = ["uv_build>=0.12.20,<0.13.0"]
+build-backend = "uv_build"

@@ -1,0 +1,863 @@
+import json
+import base64
+import asyncio
+from dataclasses import replace
+from threading import Event
+import unittest
+from unittest.mock import patch
+
+from open_gpt_voice.live.session import LiveSession
+from open_gpt_voice.ports.asr import Transcript
+from open_gpt_voice.ports.router import RouteDecision
+from open_gpt_voice.ports.talker import TalkRequest
+
+
+class FakeWebSocket:
+    def __init__(self, *events: dict[str, object]) -> None:
+        self.events = [json.dumps(event) for event in events]
+        self.sent: list[dict[str, object]] = []
+        self.closed = False
+
+    async def receive_text(self) -> str:
+        if not self.events:
+            raise EOFError
+        return self.events.pop(0)
+
+    async def send_text(self, data: str) -> None:
+        self.sent.append(json.loads(data))
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class SessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_barge_in_stops_browser_audio_and_gliner_cancels_reply_stream(self):
+        class VAD:
+            events = [
+                "speech_started", "speech_stopped", "speech_started", "speech_stopped"
+            ]
+
+            def append_audio(self, frame):
+                kind = self.events.pop(0)
+                return [type("Event", (), {"type": kind, "offset_ms": 0})()]
+
+        class ASR:
+            count = 0
+
+            def transcribe(self, audio, start_ms):
+                self.count += 1
+                text = "Explain this." if self.count == 1 else "No, I mean agentic."
+                return Transcript(text, start_ms, start_ms + 500)
+
+        class Router:
+            count = 0
+
+            def classify(self, transcript):
+                self.count += 1
+                return RouteDecision(transcript, 0.0, "chat", True, {}, interrupt_current=self.count == 2)
+
+        class Talker:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.cancelled = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def stream_reply(self, request):
+                try:
+                    yield "This should stop."
+                    self.started.set()
+                    await self.release.wait()
+                finally:
+                    self.cancelled.set()
+
+        class Speaker:
+            def synthesize(self, text, voice, cancel_event=None):
+                return b"\x00\x00" * 4_800
+
+        websocket, talker = FakeWebSocket(), Talker()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {
+            "vad": VAD(), "asr": ASR(), "router": Router(), "talker": talker,
+            "speaker": Speaker(), "tasks": object(),
+        })()
+        frame = base64.b64encode(b"\x00\x00" * 768).decode()
+
+        await session._append_audio(frame)
+        await session._append_audio(frame)
+        await asyncio.wait_for(talker.started.wait(), timeout=1)
+        for _ in range(100):
+            if any(event["type"] == "session.output_audio.delta" for event in websocket.sent):
+                break
+            await asyncio.sleep(0.01)
+        await session._append_audio(frame)
+        self.assertNotIn("session.output_audio.cancelled", [event["type"] for event in websocket.sent])
+        await session._append_audio(frame)
+        await asyncio.wait_for(talker.cancelled.wait(), timeout=1)
+        self.assertIn("session.output_audio.cancelled", [event["type"] for event in websocket.sent])
+
+        await session.close("test_complete")
+
+    async def test_wait_decision_accumulates_fragments_before_asking_talker(self):
+        class Router:
+            calls = []
+
+            def classify(self, transcript):
+                self.calls.append(transcript)
+                return RouteDecision(
+                    transcript,
+                    0.0,
+                    "chat",
+                    True,
+                    {},
+                    wait_for_user=len(self.calls) == 1,
+                )
+
+        class Talker:
+            requests = []
+
+            async def reply(self, request):
+                self.requests.append(request.transcript)
+                return "Okay."
+
+        router, talker = Router(), Talker()
+        session = LiveSession(FakeWebSocket(), self._settings(), lambda: None)
+        session.ports = type("Ports", (), {
+            "router": router, "talker": talker, "speaker": object(), "tasks": object(), "vad": object()
+        })()
+
+        await session.handle_transcript("Hmm, I think we should")
+        self.assertEqual(talker.requests, [])
+        await session.handle_transcript("make it agentic.")
+
+        self.assertEqual(router.calls, ["Hmm, I think we should", "Hmm, I think we should make it agentic."])
+        self.assertEqual(talker.requests, ["Hmm, I think we should make it agentic."])
+
+    async def test_interrupted_unplayed_reply_is_not_added_to_next_llm_context(self):
+        class Router:
+            calls = 0
+
+            def classify(self, transcript):
+                self.calls += 1
+                return RouteDecision(transcript, 0.0, "chat", True, {}, interrupt_current=self.calls == 2)
+
+        class Talker:
+            requests = []
+
+            async def reply(self, request):
+                self.requests.append(request)
+                return "An answer that was never fully played." if len(self.requests) == 1 else "Corrected answer."
+
+        session = LiveSession(FakeWebSocket(), self._settings(), lambda: None)
+        session.ports = type("Ports", (), {
+            "router": Router(), "talker": Talker(), "speaker": object(), "tasks": object(), "vad": object()
+        })()
+
+        await session.handle_transcript("Explain AI to me.")
+        await session.handle_transcript("No, I mean the difference between AI and LLM.")
+
+        self.assertEqual(
+            [(turn.role, turn.text) for turn in Talker.requests[1].history],
+            [("user", "Explain AI to me.")],
+        )
+
+    async def test_talker_reply_is_spoken_as_timed_audio_after_transcript(self) -> None:
+        class Router:
+            def classify(self, transcript):
+                return RouteDecision(transcript, 0.0, "chat", True, {})
+
+        class Talker:
+            async def reply(self, request: TalkRequest) -> str:
+                return "Hello"
+
+        class Speaker:
+            def synthesize(self, text: str, voice: str, cancel_event: Event | None = None) -> bytes:
+                self.request = (text, voice)
+                return b"\x01\x00" * 2_400
+
+        websocket = FakeWebSocket()
+        speaker = Speaker()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type(
+            "Ports",
+            (),
+            {"router": Router(), "talker": Talker(), "speaker": speaker, "tasks": object(), "vad": object()},
+        )()
+
+        await session.handle_transcript("Hi")
+        await session._utterance_task
+
+        self.assertEqual(speaker.request, ("Hello", "marin"))
+        self.assertEqual(
+            [event["type"] for event in websocket.sent],
+            [
+                "session.output_transcript.delta",
+                "session.output_audio.started",
+                "session.output_audio.transcript",
+                "session.output_audio.delta",
+            ],
+        )
+        self.assertEqual(len(base64.b64decode(websocket.sent[3]["delta"])), 4_800)
+        self.assertEqual(websocket.sent[3]["end_ms"] - websocket.sent[3]["start_ms"], 100)
+
+    async def test_actual_urgent_tool_call_prioritizes_its_reply(self) -> None:
+        from open_gpt_voice.live.session_tools import SessionTools
+
+        class Talker:
+            async def stream_reply(self, request):
+                await request.tools.execute("get_current_time", {})
+                yield "It is noon."
+
+        class Speaker:
+            def synthesize(self, text, voice, cancel_event=None):
+                return b"\x00\x00" * 2_400
+
+        websocket = FakeWebSocket()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"talker": Talker(), "speaker": Speaker()})()
+        tools = SessionTools(lambda *_: True)
+        tools.set_request_context("What time is it?")
+
+        await session._reply(TalkRequest("What time is it?", tools=tools))
+        await session._utterance_task
+
+        speech_event = next(
+            event for event in websocket.sent if event["type"] == "session.output_audio.transcript"
+        )
+        self.assertTrue(speech_event["priority"])
+        await tools.close()
+
+    async def test_speech_starts_before_streaming_text_generation_finishes(self) -> None:
+        complete_sentence = asyncio.Event()
+        release_reply = asyncio.Event()
+
+        class Router:
+            def classify(self, transcript):
+                return RouteDecision(transcript, 0.0, "chat", True, {})
+
+        class Talker:
+            async def reply(self, request: TalkRequest) -> str:
+                raise AssertionError("streaming reply should be used")
+
+            async def stream_reply(self, request: TalkRequest):
+                yield "First sentence."
+                await complete_sentence.wait()
+                yield " "
+                await release_reply.wait()
+                yield " More follows"
+
+        class Speaker:
+            def __init__(self):
+                self.started = Event()
+                self.texts = []
+
+            def synthesize(self, text: str, voice: str, cancel_event: Event | None = None) -> bytes:
+                self.texts.append(text)
+                self.started.set()
+                return b"\x00\x00" * 2_400
+
+        websocket = FakeWebSocket()
+        speaker = Speaker()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type(
+            "Ports",
+            (),
+            {"router": Router(), "talker": Talker(), "speaker": speaker, "tasks": object(), "vad": object()},
+        )()
+
+        reply_task = asyncio.create_task(session.handle_transcript("Hi"))
+        while not any(event["type"] == "session.output_transcript.delta" for event in websocket.sent):
+            await asyncio.sleep(0)
+
+        self.assertFalse(speaker.started.is_set(), "partial sentence must not be synthesized")
+        complete_sentence.set()
+        started = await asyncio.to_thread(speaker.started.wait, 1)
+
+        self.assertTrue(started, "TTS should start before the talker finishes streaming")
+        self.assertEqual(speaker.texts[0], "First sentence.")
+        self.assertEqual(
+            "".join(event["text"] for event in websocket.sent if event["type"] == "session.output_transcript.delta"),
+            "First sentence. ",
+        )
+
+        release_reply.set()
+        await reply_task
+        await session._utterance_task
+
+        self.assertEqual(speaker.texts, ["First sentence.", "More follows"])
+        self.assertEqual(
+            sum(event["type"] == "session.output_audio.started" for event in websocket.sent),
+            2,
+        )
+        audio_events = [event for event in websocket.sent if event["type"] == "session.output_audio.delta"]
+        self.assertEqual([(event["start_ms"], event["end_ms"]) for event in audio_events], [(0, 100), (100, 200)])
+
+    async def test_barge_in_cancels_remaining_audio_chunks(self) -> None:
+        class SlowWebSocket(FakeWebSocket):
+            async def send_text(self, data: str) -> None:
+                await super().send_text(data)
+                await asyncio.sleep(0.01)
+
+        class Speaker:
+            def synthesize(self, text: str, voice: str, cancel_event: Event | None = None) -> bytes:
+                return b"\x00\x00" * 24_000
+
+        websocket = SlowWebSocket()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"speaker": Speaker()})()
+        session._queue_speech("Hello")
+        utterance = session._utterance_task
+
+        while not any(event["type"] == "session.output_audio.delta" for event in websocket.sent):
+            await asyncio.sleep(0.001)
+        session._cancel_speech()
+        with self.assertRaises(asyncio.CancelledError):
+            await utterance
+
+        self.assertEqual(sum(event["type"] == "session.output_audio.delta" for event in websocket.sent), 1)
+
+    async def test_cancelled_utterance_does_not_clear_next_cancellation_event(self) -> None:
+        started = Event()
+        release = Event()
+
+        class Speaker:
+            def synthesize(self, text: str, voice: str, cancel_event: Event | None = None) -> bytes:
+                started.set()
+                release.wait(timeout=2)
+                return b"\x00\x00" * 2_400
+
+        session = LiveSession(FakeWebSocket(), self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"speaker": Speaker()})()
+        session._queue_speech("First")
+        old_utterance = session._utterance_task
+        await asyncio.to_thread(started.wait, 1)
+
+        session._cancel_speech()
+        next_cancellation = Event()
+        session._synthesis_cancel = next_cancellation
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await old_utterance
+
+        self.assertIs(session._synthesis_cancel, next_cancellation)
+
+    async def test_task_result_content_is_queued_for_speech(self) -> None:
+        class Speaker:
+            def synthesize(self, text: str, voice: str, cancel_event: Event | None = None) -> bytes:
+                self.request = (text, voice)
+                return b"\x00\x00" * 2_400
+
+        websocket = FakeWebSocket()
+        speaker = Speaker()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"speaker": speaker})()
+        session.state.delegation_ids.add("item_1")
+
+        self.assertTrue(session.handle_task_result("item_1", "Task complete"))
+        await asyncio.gather(*tuple(session._background_tasks))
+        await session._utterance_task
+
+        self.assertEqual(speaker.request, ("Task complete", "marin"))
+        event_types = [event["type"] for event in websocket.sent]
+        self.assertLess(
+            event_types.index("session.output_transcript.delta"),
+            event_types.index("session.output_audio.started"),
+        )
+        self.assertLess(
+            event_types.index("session.output_audio.started"),
+            event_types.index("session.output_audio.transcript"),
+        )
+        self.assertLess(
+            event_types.index("session.output_audio.transcript"),
+            event_types.index("session.output_audio.delta"),
+        )
+        self.assertIn("session.background.update", event_types)
+        self.assertFalse(session.handle_task_result("unknown", "Ignored"))
+        self.assertFalse(session.handle_task_result("item_1", "Repeated"))
+
+    async def test_timer_start_announces_background_work_to_client(self) -> None:
+        websocket = FakeWebSocket()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+
+        session._timer_started(30, "stretch")
+        await asyncio.sleep(0)
+
+        event = next(item for item in websocket.sent if item["type"] == "session.background.update")
+        self.assertEqual(event["message"], "I’ll remind you in 30 seconds: stretch")
+
+    async def test_background_delivery_can_be_silent(self) -> None:
+        class Router:
+            def classify_background_delivery(self, request, result, profile=None):
+                self.input = (request, result)
+                self.profile = profile
+                return "silent"
+
+        class Speaker:
+            def synthesize(self, *args, **kwargs):
+                raise AssertionError("silent results must not be synthesized")
+
+        websocket = FakeWebSocket()
+        router = Router()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"router": router, "speaker": Speaker()})()
+
+        from open_gpt_voice.ports.router import ToolProfile
+
+        profile = ToolProfile("background", "normal")
+        await session._deliver_background_result("Add this to my notes", "Added to notes", profile)
+
+        self.assertEqual(router.input, ("Add this to my notes", "Added to notes"))
+        self.assertEqual(router.profile, profile)
+        self.assertEqual([event["type"] for event in websocket.sent], ["session.background.update"])
+        self.assertEqual(websocket.sent[0]["message"], "Background work completed quietly.")
+
+    async def test_urgent_background_delivery_interrupts_after_sentence_and_prioritizes_speech(self):
+        class Router:
+            def classify_background_delivery(self, request, result, profile=None):
+                return "interrupt_after_sentence"
+
+        class Speaker:
+            def synthesize(self, text, voice, cancel_event=None):
+                self.text = text
+                return b"\x00\x00" * 2_400
+
+        websocket = FakeWebSocket()
+        speaker = Speaker()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"router": Router(), "speaker": speaker})()
+
+        await session._deliver_background_result("Notify me when it completes", "The operation completed")
+        await session._utterance_task
+
+        event_types = [event["type"] for event in websocket.sent]
+        self.assertLess(event_types.index("session.output_audio.interrupt"), event_types.index("session.output_audio.started"))
+        started = next(event for event in websocket.sent if event["type"] == "session.output_audio.started")
+        self.assertTrue(started["priority"])
+        self.assertEqual(speaker.text, "The operation completed")
+
+    async def test_urgent_function_result_is_announced_even_if_gliner_says_silent(self):
+        from open_gpt_voice.ports.router import ToolProfile
+
+        class Router:
+            def classify_background_delivery(self, request, result, profile=None):
+                return "silent"
+
+        class Speaker:
+            def synthesize(self, text, voice, cancel_event=None):
+                self.text = text
+                return b"\x00\x00" * 2_400
+
+        websocket = FakeWebSocket()
+        speaker = Speaker()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"router": Router(), "speaker": speaker})()
+
+        await session._deliver_background_result(
+            "Remind me in ten seconds", "Timer finished: stretch",
+            ToolProfile("background", "urgent", can_request_input=False),
+        )
+        await session._utterance_task
+
+        self.assertEqual(speaker.text, "Timer finished: stretch")
+        self.assertIn("session.output_audio.interrupt", [event["type"] for event in websocket.sent])
+        started = next(event for event in websocket.sent if event["type"] == "session.output_audio.started")
+        self.assertTrue(started["priority"])
+
+    async def test_background_clarification_holds_reply_until_user_responds(self):
+        class Router:
+            def classify_background_delivery(self, request, result, profile=None):
+                return "wait_for_user"
+
+            def classify(self, transcript):
+                return RouteDecision(transcript, 0.0, "chat", True, {})
+
+        class Talker:
+            request = None
+
+            async def reply(self, request):
+                self.request = request
+                return "I’ll proceed with that choice."
+
+        class Speaker:
+            def synthesize(self, text, voice, cancel_event=None):
+                return b"\x00\x00" * 2_400
+
+        websocket = FakeWebSocket()
+        talker = Talker()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"router": Router(), "talker": talker, "speaker": Speaker()})()
+
+        await session._deliver_background_result("Choose a destination", "Which destination should I use?")
+        await session._utterance_task
+        self.assertTrue(session._waiting_for_background_input)
+        interrupt = next(event for event in websocket.sent if event["type"] == "session.output_audio.interrupt")
+        self.assertTrue(interrupt["await_user"])
+        started = next(event for event in websocket.sent if event["type"] == "session.output_audio.started")
+        self.assertTrue(started["priority"])
+
+        session._pending_assistant_reply = "Unplayed text from the suspended reply."
+        await session.handle_transcript("Use the second destination.")
+        await session._utterance_task
+
+        event_types = [event["type"] for event in websocket.sent]
+        cancelled_index = event_types.index("session.output_audio.cancelled")
+        followup_index = next(
+            index for index, event in enumerate(websocket.sent)
+            if event["type"] == "session.output_transcript.delta"
+            and event.get("text") == "I’ll proceed with that choice."
+        )
+        self.assertLess(cancelled_index, followup_index)
+        self.assertFalse(session._waiting_for_background_input)
+        self.assertIn("Which destination should I use?", [turn.text for turn in talker.request.history])
+        self.assertNotIn("Unplayed text from the suspended reply.", [turn.text for turn in talker.request.history])
+
+    async def test_wait_for_user_holds_suspended_reply_audio_server_side(self):
+        class Router:
+            def classify_background_delivery(self, request, result, profile=None):
+                return "wait_for_user"
+
+        class Speaker:
+            def __init__(self):
+                self.texts = []
+                self.result_spoken = Event()
+
+            def synthesize(self, text, voice, cancel_event=None):
+                self.texts.append(text)
+                if text == "Which option should I use?":
+                    self.result_spoken.set()
+                return b"\x00\x00" * 2_400
+
+        websocket = FakeWebSocket()
+        speaker = Speaker()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"router": Router(), "speaker": speaker})()
+        session._can_speak.clear()
+        session._queue_speech("Suspended reply that must wait.", transcript_sent=True)
+
+        await session._deliver_background_result("Choose an option", "Which option should I use?")
+        session._resume_speech()
+        self.assertTrue(await asyncio.to_thread(speaker.result_spoken.wait, 1))
+        await asyncio.sleep(0.05)
+
+        self.assertTrue(session._waiting_for_background_input)
+        self.assertEqual(speaker.texts, ["Which option should I use?"])
+        await session.close("test")
+
+    async def test_priority_speech_runs_after_current_sentence_before_queued_sentences(self):
+        started = Event()
+        release = Event()
+
+        class Speaker:
+            def __init__(self):
+                self.texts = []
+
+            def synthesize(self, text, voice, cancel_event=None):
+                self.texts.append(text)
+                if text == "Current sentence.":
+                    started.set()
+                    release.wait(timeout=2)
+                return b"\x00\x00" * 2_400
+
+        websocket = FakeWebSocket()
+        speaker = Speaker()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"speaker": speaker})()
+        session._queue_speech("Current sentence.")
+        utterance = session._utterance_task
+        await asyncio.to_thread(started.wait, 1)
+        session._queue_speech("Later sentence.")
+        session._queue_speech("Urgent update.", priority=True)
+        release.set()
+        await utterance
+
+        self.assertEqual(speaker.texts, ["Current sentence.", "Urgent update.", "Later sentence."])
+        priorities = [
+            event["priority"] for event in websocket.sent
+            if event["type"] == "session.output_audio.started"
+        ]
+        self.assertEqual(priorities, [False, True, False])
+
+    async def test_closing_session_rejects_task_callback(self) -> None:
+        session = LiveSession(FakeWebSocket(), self._settings(), lambda: None)
+        session.state.delegation_ids.add("item_1")
+        session.state.closing = True
+
+        self.assertFalse(session.handle_task_result("item_1", "Late result"))
+
+    async def test_transcript_talk_task_and_both_paths(self) -> None:
+        class Router:
+            def __init__(self, decision):
+                self.decision = decision
+
+            def classify(self, transcript):
+                return self.decision
+
+        class Talker:
+            async def reply(self, request: TalkRequest) -> str:
+                self.request = request
+                return "Sure."
+
+        class Tasks:
+            async def create(self, delegation_id, session_id, transcript, labels):
+                self.request = (delegation_id, session_id, transcript, labels)
+
+        talker = Talker()
+        tasks = Tasks()
+        websocket = FakeWebSocket()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"router": Router(RouteDecision("", 0.9, "task", True, {"kind": "task"})), "talker": talker, "tasks": tasks, "vad": object()})()
+
+        await session.handle_transcript("Do it")
+
+        self.assertEqual(websocket.sent[0]["type"], "session.output_transcript.delta")
+        self.assertEqual(websocket.sent[1]["type"], "session.delegation.created")
+        self.assertEqual(tasks.request[2:], ("Do it", {"kind": "task"}))
+        self.assertEqual(talker.request.transcript, "Do it")
+        self.assertIn("natural voice conversation partner", talker.request.instructions[0])
+        self.assertIn("acknowledge that it started once", talker.request.instructions[0])
+        self.assertEqual(websocket.sent[1]["delegation_id"], tasks.request[0])
+
+    async def test_transcript_adapter_failure_is_recoverable(self) -> None:
+        class Router:
+            def classify(self, transcript):
+                raise RuntimeError("broken")
+
+        websocket = FakeWebSocket()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"router": Router(), "talker": object(), "tasks": object(), "vad": object()})()
+
+        await session.handle_transcript("Hello")
+
+        self.assertEqual(websocket.sent[0]["type"], "error")
+        self.assertEqual(websocket.sent[0]["error"]["code"], "internal_error")
+
+    async def test_task_http_failure_is_session_scoped(self) -> None:
+        class Router:
+            def classify(self, transcript):
+                return RouteDecision(transcript, 0.9, "task", False, {"kind": "task"})
+
+        class Tasks:
+            async def create(self, delegation_id, session_id, transcript, labels):
+                raise OSError("task service unavailable")
+
+        websocket = FakeWebSocket()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type(
+            "Ports",
+            (),
+            {"router": Router(), "tasks": Tasks(), "talker": object(), "speaker": object(), "vad": object()},
+        )()
+
+        await session.handle_transcript("Do it")
+
+        self.assertEqual(websocket.sent[-1]["error"]["code"], "task_dispatch_failed")
+        self.assertFalse(session.state.delegation_ids)
+        self.assertFalse(any(event["type"] == "session.delegation.created" for event in websocket.sent))
+
+    async def test_start_commands_and_close(self) -> None:
+        websocket = FakeWebSocket(
+            {"type": "session.start", "event_id": "start", "model": "gpt-live-1"},
+            {"type": "session.instructions.append", "event_id": "instructions", "text": "Be concise."},
+            {"type": "session.input_audio.mute", "event_id": "mute"},
+            {"type": "session.input_audio.unmute", "event_id": "unmute"},
+            {"type": "session.close"},
+        )
+        session = LiveSession(websocket, self._settings(), lambda: None)
+
+        await session.run()
+
+        self.assertEqual(
+            [event["type"] for event in websocket.sent],
+            [
+                "session.started",
+                "session.instructions.appended",
+                "session.input_audio.muted",
+                "session.input_audio.unmuted",
+                "session.closed",
+            ],
+        )
+        self.assertEqual(websocket.sent[1]["client_event_id"], "instructions")
+        self.assertEqual(websocket.sent[0]["client_event_id"], "start")
+        self.assertTrue(websocket.closed)
+        self.assertEqual(session.state.instructions, ["Be concise."])
+        self.assertEqual(websocket.sent[-1]["reason"], "close_requested")
+        self.assertEqual(websocket.sent[-1]["usage"]["seconds"], 0)
+
+    async def test_usage_updates_and_expiry_close_resources(self) -> None:
+        class WaitingWebSocket(FakeWebSocket):
+            async def receive_text(self) -> str:
+                if self.events:
+                    return await super().receive_text()
+                await asyncio.Future()
+
+        class Resource:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        websocket = WaitingWebSocket({"type": "session.start", "model": "gpt-live-1"})
+        resource = Resource()
+        shared_speaker = Resource()
+        task_adapter = Resource()
+        session = LiveSession(
+            websocket,
+            replace(self._settings(), max_session_duration_s=0.12),
+            lambda: type("Ports", (), {"vad": resource, "speaker": shared_speaker, "tasks": task_adapter})(),
+        )
+
+        with patch("open_gpt_voice.live.session._USAGE_UPDATE_INTERVAL_SECONDS", 0.025):
+            await session.run()
+
+        updates = [event["usage"]["seconds"] for event in websocket.sent if event["type"] == "session.usage.updated"]
+        self.assertGreaterEqual(len(updates), 2)
+        self.assertEqual(updates, sorted(updates))
+        self.assertEqual(websocket.sent[-1]["type"], "session.closed")
+        self.assertEqual(websocket.sent[-1]["reason"], "expired")
+        self.assertGreaterEqual(websocket.sent[-1]["usage"]["seconds"], updates[-1])
+        self.assertTrue(resource.closed)
+        self.assertFalse(shared_speaker.closed)
+        self.assertFalse(task_adapter.closed)
+        self.assertIsNone(session.ports)
+        self.assertTrue(websocket.closed)
+
+    async def test_expiry_interrupts_in_flight_session_work(self) -> None:
+        operation_started = Event()
+        release_operation = Event()
+
+        class SlowVAD:
+            def append_audio(self, frame: bytes):
+                operation_started.set()
+                release_operation.wait(timeout=1)
+                return []
+
+        websocket = FakeWebSocket(
+            {"type": "session.start", "model": "gpt-live-1"},
+            {"type": "session.input_audio.append", "audio": base64.b64encode(b"\x00\x00" * 768).decode()},
+        )
+        session = LiveSession(
+            websocket,
+            replace(self._settings(), max_session_duration_s=1),
+            lambda: type("Ports", (), {"vad": SlowVAD()})(),
+        )
+
+        try:
+            with patch("open_gpt_voice.live.session._USAGE_UPDATE_INTERVAL_SECONDS", 60):
+                await session.run()
+            self.assertTrue(operation_started.is_set())
+            self.assertEqual(websocket.sent[-1]["type"], "session.closed")
+            self.assertEqual(websocket.sent[-1]["reason"], "expired")
+        finally:
+            release_operation.set()
+
+    async def test_disconnect_closes_with_connection_lost_reason(self) -> None:
+        websocket = FakeWebSocket({"type": "session.start", "model": "gpt-live-1"})
+        session = LiveSession(websocket, self._settings(), lambda: None)
+
+        await session.run()
+
+        self.assertEqual(websocket.sent[-1]["type"], "session.closed")
+        self.assertEqual(websocket.sent[-1]["reason"], "connection_lost")
+
+    async def test_unexpected_run_failure_still_closes_session_resources(self) -> None:
+        class BrokenWebSocket(FakeWebSocket):
+            async def receive_text(self) -> str:
+                if self.events:
+                    return await super().receive_text()
+                raise RuntimeError("receive failed")
+
+        class Resource:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        websocket = BrokenWebSocket({"type": "session.start", "model": "gpt-live-1"})
+        resource = Resource()
+        session = LiveSession(
+            websocket,
+            self._settings(),
+            lambda: type("Ports", (), {"vad": resource})(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "receive failed"):
+            await session.run()
+
+        self.assertEqual(websocket.sent[-1]["type"], "session.closed")
+        self.assertEqual(websocket.sent[-1]["reason"], "connection_lost")
+        self.assertTrue(resource.closed)
+
+    async def test_close_cancels_current_and_queued_speech(self) -> None:
+        synthesis_started = Event()
+
+        class Speaker:
+            def __init__(self):
+                self.requests = []
+
+            def synthesize(self, text: str, voice: str, cancel_event: Event | None = None) -> bytes:
+                self.requests.append(text)
+                synthesis_started.set()
+                while cancel_event is not None and not cancel_event.wait(0.01):
+                    pass
+                return b"\x00\x00" * 2_400
+
+        websocket = FakeWebSocket()
+        speaker = Speaker()
+        session = LiveSession(websocket, self._settings(), lambda: None)
+        session.ports = type("Ports", (), {"speaker": speaker})()
+        session._queue_speech("Current")
+        await asyncio.to_thread(synthesis_started.wait, 1)
+        session._queue_speech("Queued")
+
+        await session.close("close_requested")
+
+        self.assertEqual(speaker.requests, ["Current"])
+        self.assertEqual(websocket.sent[-1]["type"], "session.closed")
+        self.assertFalse(any(event["type"] == "session.output_audio.delta" for event in websocket.sent))
+
+    async def test_commands_before_start_are_rejected_and_session_stays_up(self) -> None:
+        websocket = FakeWebSocket(
+            {"type": "session.close"},
+            {"type": "session.start", "model": "gpt-live-1"},
+            {"type": "session.close"},
+        )
+        session = LiveSession(websocket, self._settings(), lambda: None)
+
+        await session.run()
+
+        self.assertEqual(websocket.sent[0]["type"], "error")
+        self.assertEqual(websocket.sent[0]["error"]["code"], "invalid_value")
+        self.assertEqual(websocket.sent[-1]["type"], "session.closed")
+
+    async def test_each_session_gets_its_own_ports(self) -> None:
+        created: list[object] = []
+
+        def factory() -> object:
+            port = object()
+            created.append(port)
+            return port
+
+        first = LiveSession(FakeWebSocket({"type": "session.start", "model": "gpt-live-1"}, {"type": "session.close"}), self._settings(), factory)
+        second = LiveSession(FakeWebSocket({"type": "session.start", "model": "gpt-live-1"}, {"type": "session.close"}), self._settings(), factory)
+
+        await first.run()
+        await second.run()
+
+        self.assertEqual(len(created), 2)
+        self.assertIsNot(created[0], created[1])
+
+    @staticmethod
+    def _settings():
+        from open_gpt_voice.config import Settings
+
+        return Settings(
+            bearer_token="test-token",
+            silero_model_path="silero",
+            whisper_model_path="whisper",
+            gliner_model_path="gliner",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
