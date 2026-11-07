@@ -20,6 +20,8 @@ SUPPORTED_CLIENT_EVENTS = frozenset(
         "session.instructions.append",
         "session.thinking.append",
         "session.commentary.append",
+        "response.item.create",
+        "response.create",
         "session.close",
     }
 )
@@ -131,21 +133,58 @@ def authenticate(authorization: str | None, expected_token: str) -> bool:
 
 
 def _validate_start(data: Mapping[str, Any], event_id: str | None) -> None:
+    validate_session_config(data, event_id)
+
+
+def validate_session_config(
+    data: Mapping[str, Any], event_id: str | None = None
+) -> dict[str, Any]:
+    """Validate a startup configuration and return its normalized fields.
+
+    Accepts the WebSocket ``session.start`` payload and the ``session`` object
+    posted to ``POST /v1/live/sessions`` for WebRTC.
+    """
     if data.get("model") != "gpt-live-1":
         _fail("invalid_value", "model must be gpt-live-1", "model", event_id)
-    delegation = data.get("delegation", {})
+    delegation = data.get("delegation") or {"type": "client"}
     if not isinstance(delegation, dict):
         _fail("invalid_value", "delegation must be an object", "delegation", event_id)
-    if delegation.get("type", "client") != "client":
-        _fail("invalid_value", "delegation.type must be client", "delegation.type", event_id)
+    mode = delegation.get("type", "client")
+    if mode not in {"client", "responses"}:
+        _fail(
+            "invalid_value",
+            "delegation.type must be client or responses",
+            "delegation.type",
+            event_id,
+        )
+    responses = delegation.get("responses")
+    if responses is not None and not isinstance(responses, dict):
+        _fail("invalid_value", "delegation.responses must be an object", "delegation.responses", event_id)
+    instructions = data.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        _fail("invalid_value", "instructions must be a string", "instructions", event_id)
+    history = data.get("input")
+    if history is not None and not isinstance(history, list):
+        _fail("invalid_value", "input must be an array", "input", event_id)
     _validate_audio_format(data.get("audio"), event_id)
+    resolved_delegation: dict[str, Any] = {"type": mode}
+    if isinstance(responses, dict):
+        resolved_delegation["responses"] = responses
+    return {
+        "model": data["model"],
+        "delegation": resolved_delegation,
+        "audio_format": _normalized_audio_format(data.get("audio")),
+        "instructions": instructions or "",
+        "history": history or [],
+        "voice": _voice(data),
+    }
 
 
 def _validate_update(data: Mapping[str, Any], event_id: str | None) -> None:
     changed = data.get("session", data)
     if not isinstance(changed, dict):
         _fail("invalid_value", "session must be an object", "session", event_id)
-    for field_name in ("model", "instructions", "audio", "delegation"):
+    for field_name in ("model", "instructions", "audio"):
         if field_name in changed:
             _fail(
                 "immutable_field_update",
@@ -153,6 +192,14 @@ def _validate_update(data: Mapping[str, Any], event_id: str | None) -> None:
                 f"session.{field_name}",
                 event_id,
             )
+    delegation = changed.get("delegation")
+    if delegation is not None:
+        _fail(
+            "immutable_field_update",
+            "delegation cannot be changed after session.start",
+            "session.delegation",
+            event_id,
+        )
 
 
 def _validate_append(data: Mapping[str, Any], event_id: str | None) -> None:
@@ -179,7 +226,12 @@ def _validate_audio(data: Mapping[str, Any], event_id: str | None) -> None:
 
 
 def _validate_audio_format(audio: Any, event_id: str | None) -> None:
-    """Validate supplied audio formats against the fixed WebSocket audio contract."""
+    """Validate supplied audio formats against the fixed 24 kHz mono contract.
+
+    GPT-Live documents ``{"type": "audio/pcm", "rate": 24000}``; the original
+    WebSocket slice used ``{"encoding": "pcm16le", "sample_rate": 24000,
+    "channels": 1}``. Both are accepted and normalized internally.
+    """
     if audio is None:
         return
     if not isinstance(audio, dict):
@@ -194,6 +246,10 @@ def _validate_audio_format(audio: Any, event_id: str | None) -> None:
         found_format = True
         if not isinstance(audio_format, dict):
             _fail("invalid_value", "audio.format must be an object", "audio.format", event_id)
+        if audio_format.get("type") == "audio/pcm":
+            if audio_format.get("rate") != 24000:
+                _fail("invalid_value", "audio.format.rate must be 24000", "audio.format.rate", event_id)
+            continue
         expected = {"encoding": "pcm16le", "sample_rate": 24000, "channels": 1}
         for key, required in expected.items():
             if key not in audio_format:
@@ -202,6 +258,24 @@ def _validate_audio_format(audio: Any, event_id: str | None) -> None:
                 _fail("invalid_value", f"audio.format.{key} must be {required}", f"audio.format.{key}", event_id)
     if not found_format:
         _fail("invalid_value", "audio.format is required when audio is supplied", "audio.format", event_id)
+
+
+def _normalized_audio_format(audio: Any) -> dict[str, Any]:
+    """Return the canonical GPT-Live PCM format advertised in session.started."""
+    return {"type": "audio/pcm", "rate": 24000}
+
+
+def _voice(data: Mapping[str, Any]) -> str:
+    """Resolve the requested voice from either supported payload shape."""
+    audio = data.get("audio")
+    if isinstance(audio, dict):
+        output = audio.get("output")
+        if isinstance(output, dict) and isinstance(output.get("voice"), str) and output["voice"]:
+            return output["voice"]
+    voice = data.get("voice")
+    if isinstance(voice, str) and voice:
+        return voice
+    return "marin"
 
 
 def _fail(code: str, message: str, param: str, event_id: str | None) -> None:

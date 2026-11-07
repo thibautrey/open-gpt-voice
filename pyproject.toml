@@ -22,6 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 laya = ["laya[onnx]>=0.3.20,<1"]
+webrtc = ["aiortc>=1.9,<2"]
 
 [project.scripts]
 open-gpt-voice = "open_gpt_voice:main"

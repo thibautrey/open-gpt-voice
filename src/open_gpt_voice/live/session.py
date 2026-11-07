@@ -8,7 +8,7 @@ import re
 import time
 from base64 import b64decode, b64encode
 from binascii import Error as Base64Error
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from itertools import count
 from threading import Event as ThreadEvent
@@ -18,9 +18,17 @@ from uuid import uuid4
 from loguru import logger
 
 from ..config import Settings
+from ..ports.backend import BackendMessage, BackendRequest
 from ..ports.router import RouteDecision, ToolProfile
 from ..ports.talker import TalkRequest, TranscriptTurn
-from .protocol import ClientEvent, ProtocolError, ServerEvent, parse_client_event
+from ..ports.turn import TurnDecision
+from .protocol import (
+    ClientEvent,
+    ProtocolError,
+    ServerEvent,
+    parse_client_event,
+    validate_session_config,
+)
 from .session_tools import SessionTools
 
 if TYPE_CHECKING:
@@ -79,6 +87,8 @@ class SessionState:
     speech_start_ms: int | None = None
     vad_pending_audio: bytearray = field(default_factory=bytearray)
     voice: str = "marin"
+    delegation_mode: str = "client"
+    delegation_config: Mapping[str, Any] = field(default_factory=dict)
     delegation_ids: set[str] = field(default_factory=set)
     delegation_requests: dict[str, str] = field(default_factory=dict)
     pending_transcripts: list[str] = field(default_factory=list)
@@ -87,14 +97,24 @@ class SessionState:
 class LiveSession:
     """Run one authenticated WebSocket session until it closes."""
 
-    def __init__(self, websocket: WebSocketLike, settings: Settings, port_factory: PortFactory) -> None:
+    def __init__(
+        self,
+        websocket: WebSocketLike,
+        settings: Settings,
+        port_factory: PortFactory,
+        *,
+        session_id: str | None = None,
+        session_config: Mapping[str, Any] | None = None,
+    ) -> None:
         self.websocket = websocket
         self.settings = settings
         self.port_factory = port_factory
-        self.state = SessionState()
+        self.state = SessionState(session_id=session_id or f"sess_{uuid4().hex}")
+        self.session_config = session_config
         self.log = logger.bind(component="live-session", session_id=self.state.session_id)
         self.ports: Ports | None = None
         self.started_at = 0.0
+        self._subscribers: set[asyncio.Queue[str]] = set()
         self._speech_queue: asyncio.PriorityQueue[tuple[int, int, str, bool]] = asyncio.PriorityQueue()
         self._speech_order = count()
         self._utterance_task: asyncio.Task[None] | None = None
@@ -116,6 +136,8 @@ class LiveSession:
     async def run(self) -> None:
         """Read, validate, route, and acknowledge events until disconnect."""
         try:
+            if self.session_config is not None and not self.state.started:
+                await self._start_config(self.session_config)
             await self._run()
         finally:
             if not self.state.closing:
@@ -181,15 +203,37 @@ class LiveSession:
 
     async def _start(self, event: ClientEvent) -> None:
         """Create this session's ports and announce the resolved session."""
+        await self._apply_start(event.data, event.event_id)
+
+    async def _start_config(self, config: Mapping[str, Any]) -> None:
+        """Start a WebRTC session from the POST /v1/live/sessions body."""
+        try:
+            await self._apply_start(config, None)
+        except ProtocolError as error:
+            await self._send(error.as_error())
+            await self.close("invalid_config")
+
+    async def _apply_start(self, data: Mapping[str, Any], event_id: str | None) -> None:
+        """Resolve startup configuration, build ports, and emit session.started."""
+        resolved = validate_session_config(data, event_id)
         try:
             self.ports = self.port_factory()
         except Exception:
             self.log.exception("Session adapter initialization failed")
             await self._send_error("internal_error", "Unable to initialize session adapters")
 
-        voice = event.data.get("voice")
-        if isinstance(voice, str) and voice:
-            self.state.voice = voice
+        self.state.voice = resolved["voice"]
+        if resolved["instructions"]:
+            self.state.instructions = [resolved["instructions"]]
+        self.state.delegation_mode = resolved["delegation"]["type"]
+        self.state.delegation_config = resolved["delegation"]
+        for message in resolved["history"]:
+            if not isinstance(message, Mapping):
+                continue
+            role, content = message.get("role"), message.get("content")
+            if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+                self.state.history.append(TranscriptTurn(role, content))
+        del self.state.history[:-_MAX_HISTORY_TURNS]
 
         self.state.started = True
         self._tools = SessionTools(
@@ -197,20 +241,35 @@ class LiveSession:
             on_timer_started=self._timer_started,
             session_id=self.state.session_id,
         )
-        self.log.info("Live session started", model=event.data["model"], voice=self.state.voice)
+        self.log.info(
+            "Live session started",
+            model=resolved["model"],
+            voice=self.state.voice,
+            delegation_mode=self.state.delegation_mode,
+        )
         self.started_at = time.monotonic()
         self._next_usage_update = self.started_at + _USAGE_UPDATE_INTERVAL_SECONDS
-        data = {
+        payload: dict[str, Any] = {
             "session": {
                 "id": self.state.session_id,
-                "model": event.data["model"],
-                "delegation": {"type": "client"},
-                "audio": {"format": {"encoding": "pcm16le", "sample_rate": 24000, "channels": 1}},
+                "model": resolved["model"],
+                "delegation": dict(self.state.delegation_config),
+                "audio": {
+                    "format": resolved["audio_format"],
+                    "output": {"voice": self.state.voice},
+                },
             }
         }
-        if event.event_id is not None:
-            data["client_event_id"] = event.event_id
-        await self._send(ServerEvent("session.started", data))
+        if event_id is not None:
+            payload["client_event_id"] = event_id
+        await self._send(ServerEvent("session.started", payload))
+        for subscriber in tuple(self._subscribers):
+            subscriber.put_nowait(
+                ServerEvent(
+                    "session.attached",
+                    {"session": {"id": self.state.session_id, "model": resolved["model"]}},
+                ).to_json()
+            )
 
     async def _handle(self, event: ClientEvent) -> None:
         """Apply a validated event to this session's isolated state."""
@@ -254,7 +313,25 @@ class LiveSession:
                 )
                 return
             if event.type == "session.update":
+                changed = event.data.get("session", event.data)
+                delegation = changed.get("delegation") if isinstance(changed, Mapping) else None
+                if isinstance(delegation, Mapping):
+                    requested = delegation.get("type", "client")
+                    if requested != self.state.delegation_mode:
+                        await self._send_error(
+                            "immutable_field_update",
+                            "delegation.type cannot change after session.start",
+                        )
+                        return
+                    self.state.delegation_config = dict(delegation)
                 await self._ack("session.updated", event)
+                return
+            if event.type == "response.item.create":
+                await self._ack("response.item.created", event)
+                return
+            if event.type == "response.create":
+                await self._ack("response.created", event)
+                return
         except Exception:
             self.log.exception("Client event handling failed", event_type=event.type)
             await self._send_error("internal_error", "Session adapter failed")
@@ -276,7 +353,8 @@ class LiveSession:
             stopped_at: int | None = None
             for event in events:
                 if event.type == "speech_started":
-                    self.state.speech_start_ms = event.offset_ms
+                    if self.state.speech_start_ms is None:
+                        self.state.speech_start_ms = event.offset_ms
                     self._can_speak.clear()
                     self.log.info("User speech started; pausing assistant audio until routed", offset_ms=event.offset_ms)
                 elif event.type == "speech_stopped":
@@ -289,7 +367,29 @@ class LiveSession:
                     del self.state.speech_audio[:excess]
                     self.state.speech_start_ms += excess // 48
             if stopped_at is not None:
-                await self._finish_turn(stopped_at)
+                decision = self._turn_decision(stopped_at)
+                if decision.complete:
+                    await self._finish_turn(stopped_at)
+                else:
+                    self.log.info(
+                        "Turn kept open by detector",
+                        confidence=decision.confidence,
+                        reason=decision.reason,
+                        buffered_bytes=len(self.state.speech_audio),
+                    )
+
+    def _turn_decision(self, end_ms: int) -> TurnDecision:
+        """Ask the optional turn detector whether this silence ends the turn."""
+        detector = getattr(self.ports, "turn", None) if self.ports is not None else None
+        if detector is None or not callable(getattr(detector, "is_complete", None)):
+            return TurnDecision(True, 1.0, "silence")
+        try:
+            return detector.is_complete(
+                bytes(self.state.speech_audio), self.state.speech_start_ms or 0
+            )
+        except Exception:
+            self.log.exception("Turn detector failed; finishing the turn")
+            return TurnDecision(True, 0.0, "silence")
 
     async def _finish_turn(self, end_ms: int) -> None:
         """Move one completed audio buffer into background turn processing."""
@@ -439,6 +539,15 @@ class LiveSession:
                 del self.state.history[:-_MAX_HISTORY_TURNS]
                 self.state.transcripts.append(transcript)
             if decision.task:
+                if (
+                    self.state.delegation_mode == "responses"
+                    and getattr(self.ports, "backend", None) is not None
+                ):
+                    task = asyncio.create_task(self._run_responses_delegation(transcript, decision))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                    self._resume_speech()
+                    return
                 delegation_id = f"item_{uuid4().hex}"
                 self.state.delegation_ids.add(delegation_id)
                 self.state.delegation_requests[delegation_id] = transcript
@@ -453,13 +562,92 @@ class LiveSession:
                     await self._send(
                         ServerEvent(
                             "session.delegation.created",
-                            {"delegation_id": delegation_id, "target": "client"},
+                            {
+                                "offset_ms": self.state.output_audio_ms,
+                                "delegation": {
+                                    "id": delegation_id,
+                                    "type": "delegation",
+                                    "target": "client",
+                                },
+                            },
                         )
                     )
         except Exception:
             self.log.exception("Transcript routing failed")
             await self._send_error("internal_error", "Session adapter failed")
             self._resume_speech()
+
+    async def _run_responses_delegation(
+        self, transcript: str, decision: RouteDecision
+    ) -> None:
+        """Delegate a turn to the backend model and forward its Responses events."""
+        backend = getattr(self.ports, "backend", None) if self.ports is not None else None
+        if backend is None:
+            await self._send_error("delegation_failed", "No delegated backend is configured")
+            return
+        delegation_id = f"item_{uuid4().hex}"
+        response_id = f"resp_{uuid4().hex}"
+        config = self.state.delegation_config.get("responses")
+        model = config.get("model") if isinstance(config, Mapping) else None
+        if not isinstance(model, str) or not model:
+            model = self.settings.responses_model
+        tools = tuple(self._tools.schemas) if self._tools is not None else ()
+        request = BackendRequest(
+            model=model,
+            transcript=transcript,
+            instructions=(*_DEFAULT_VOICE_INSTRUCTIONS, *self.state.instructions),
+            history=tuple(BackendMessage(turn.role, turn.text) for turn in self.state.history),
+            tools=tools,
+        )
+        self.log.info(
+            "Responses delegation started",
+            delegation_id=delegation_id,
+            backend_model=model,
+            tool_count=len(tools),
+        )
+        await self._send(
+            ServerEvent(
+                "session.delegation.created",
+                {
+                    "offset_ms": self.state.output_audio_ms,
+                    "delegation": {
+                        "id": delegation_id,
+                        "type": "delegation",
+                        "target": "responses",
+                        "response_id": response_id,
+                    },
+                },
+            )
+        )
+        text_parts: list[str] = []
+        buffer = ""
+        try:
+            async for event in backend.stream(request):
+                payload = dict(event)
+                await self._send(
+                    ServerEvent("response.event", {"delegation_id": delegation_id, "event": payload})
+                )
+                if payload.get("type") == "response.output_text.delta":
+                    delta = payload.get("delta")
+                    if isinstance(delta, str):
+                        text_parts.append(delta)
+                        buffer += delta
+                        chunks, buffer = _take_speech_chunks(buffer)
+                        for chunk in chunks:
+                            self._queue_speech(chunk)
+            if buffer.strip():
+                self._queue_speech(buffer.strip())
+            reply = "".join(text_parts)
+            if reply.strip():
+                self.state.history.append(TranscriptTurn("assistant", reply))
+                del self.state.history[:-_MAX_HISTORY_TURNS]
+                self.state.transcripts.append(reply)
+        except asyncio.CancelledError:
+            self.log.info("Responses delegation cancelled", delegation_id=delegation_id)
+            raise
+        except Exception:
+            self.log.exception("Responses delegation failed", delegation_id=delegation_id)
+            await self._send_error("delegation_failed", "Delegated backend failed")
 
     def _cancel_response(self) -> None:
         """Stop the active model stream so no more stale sentences are queued."""
@@ -759,9 +947,40 @@ class LiveSession:
         await self._send(ProtocolError(code, message).as_error())
 
     async def _send(self, event: ServerEvent) -> None:
-        """Serialize and send one server event."""
+        """Serialize and send one server event to the primary and sideband peers."""
         async with self._send_lock:
-            await self.websocket.send_text(event.to_json())
+            payload = event.to_json()
+            await self.websocket.send_text(payload)
+            for subscriber in tuple(self._subscribers):
+                subscriber.put_nowait(payload)
+
+    def subscribe(self) -> asyncio.Queue[str]:
+        """Register a sideband subscriber and return its event queue."""
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        self._subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[str]) -> None:
+        """Remove one sideband subscriber."""
+        self._subscribers.discard(queue)
+
+    async def receive_command(self, raw: str) -> None:
+        """Apply one command received on an attached sideband socket."""
+        try:
+            event = parse_client_event(raw)
+        except ProtocolError as error:
+            await self._send(error.as_error())
+            return
+        if event.type == "session.start":
+            await self._send_error("invalid_value", "session.start may not be sent on an attached sideband")
+            return
+        if event.type == "session.close":
+            await self.close("close_requested")
+            return
+        if not self.state.started:
+            await self._send_error("invalid_value", "Session is not started")
+            return
+        await self._handle(event)
 
     async def close(self, reason: str) -> None:
         """Emit final usage once and close the underlying WebSocket."""

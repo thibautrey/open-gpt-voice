@@ -25,6 +25,7 @@ class LMStudioTalker(Talker):
         model: str,
         *,
         reasoning_effort: str = "none",
+        api_key: str | None = None,
         transport: Transport | None = None,
         stream_transport: StreamTransport | None = None,
     ) -> None:
@@ -32,9 +33,17 @@ class LMStudioTalker(Talker):
         self.url = base_url.rstrip("/") + ("/chat" if self.native else "/chat/completions")
         self.model = model
         self.reasoning_effort = reasoning_effort
+        self.api_key = api_key
         self.transport = transport or _post_json
         self.stream_transport = stream_transport
         self.log = logger.bind(component="lmstudio")
+
+    def _headers(self) -> dict[str, str]:
+        """Return JSON headers plus bearer auth when a key is configured."""
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     async def reply(self, request: TalkRequest) -> str:
         """Generate one reply without blocking the event loop."""
@@ -46,7 +55,7 @@ class LMStudioTalker(Talker):
         if not self.native:
             payload["reasoning_effort"] = self.reasoning_effort
         body = json.dumps(payload).encode("utf-8")
-        raw = await asyncio.to_thread(self.transport, self.url, body, {"Content-Type": "application/json"})
+        raw = await asyncio.to_thread(self.transport, self.url, body, self._headers())
         try:
             response = json.loads(raw)
             content = _native_content(response) if self.native else response["choices"][0]["message"]["content"]
@@ -115,7 +124,7 @@ class LMStudioTalker(Talker):
                 for _ in range(4):
                     payload["messages"] = messages
                     tool_calls: dict[int, dict[str, object]] = {}
-                    async with client.stream("POST", self.url, json=payload) as response:
+                    async with client.stream("POST", self.url, json=payload, headers=self._headers()) as response:
                         response.raise_for_status()
                         async for event_type, event in _sse_events(response):
                             fragment = _stream_fragment(event_type, event, False)
@@ -129,7 +138,7 @@ class LMStudioTalker(Talker):
                         return
                     await _append_tool_results(messages, tool_calls, request)
                 raise RuntimeError("LM Studio exceeded the tool-call limit")
-            async with client.stream("POST", self.url, json=payload) as response:
+            async with client.stream("POST", self.url, json=payload, headers=self._headers()) as response:
                 response.raise_for_status()
                 async for event_type, event in _sse_events(response):
                     fragment = _stream_fragment(event_type, event, self.native)

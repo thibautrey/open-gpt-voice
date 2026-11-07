@@ -614,7 +614,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(talker.request.transcript, "Do it")
         self.assertIn("natural voice conversation partner", talker.request.instructions[0])
         self.assertIn("acknowledge that it started once", talker.request.instructions[0])
-        self.assertEqual(websocket.sent[1]["delegation_id"], tasks.request[0])
+        self.assertEqual(websocket.sent[1]["delegation"]["id"], tasks.request[0])
 
     async def test_transcript_adapter_failure_is_recoverable(self) -> None:
         class Router:

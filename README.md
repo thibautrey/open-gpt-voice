@@ -18,6 +18,7 @@ This is more than a chatbot with a microphone attached. It is a small playground
 - [Who it is for](#who-it-is-for)
 - [Use cases and scenarios](#use-cases-and-scenarios)
 - [How it works](#how-it-works)
+- [GPT-Live-compatible WebRTC and delegation layer](#gpt-live-compatible-webrtc-and-delegation-layer)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Tools, background tasks, and API](#tools-background-tasks-and-api)
@@ -193,6 +194,20 @@ flowchart LR
 9. A new routed interruption can cancel stale generation and speech; a background result can join the same queue at the right time.
 
 The session layer does not import Silero, Whisper, GLiNER, Laya, LM Studio, or Supertonic directly. It talks to small ports, while adapters own model-library details. This keeps orchestration testable and makes components replaceable.
+
+## GPT-Live-compatible WebRTC and delegation layer
+
+The session contract can be reached the way GPT-Live clients expect it:
+
+- `POST /v1/live/sessions` takes an SDP offer and returns an SDP answer. Events flow over the `oai-events` data channel; microphone audio arrives on the WebRTC audio track and generated speech leaves on the outgoing track.
+- `WS /v1/live/sessions` remains available as a WebSocket-only transport.
+- `WS /v1/live/sessions/{id}/attach` attaches a server-side sideband to a running session.
+- `delegation.type` is `client` or `responses`; the latter calls an OpenAI-compatible `/v1/responses` endpoint and relays its stream as `response.event`.
+- ASR, TTS, and delegated reasoning can be any OpenAI-compatible server (`faster_whisper`/Supertonic remain the local defaults). Voxtral Realtime and Voxtral TTS work through vLLM, but nothing is tied to Mistral.
+
+Install the WebRTC extra with `pip install '.[webrtc]'`. Full endpoint, payload, configuration, and limitation details are in [docs/gpt-live-compat.md](docs/gpt-live-compat.md).
+
+This is still a cascade: barge-in stops playback immediately, but the model does not listen while it speaks. A true duplex model is a separate problem.
 
 ## Quick start
 
