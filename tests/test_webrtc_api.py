@@ -201,6 +201,35 @@ async def _run_delegation(session) -> None:
     await asyncio.gather(*session._background_tasks)
 
 
+class WebRTCTransportTests(unittest.TestCase):
+    def test_already_open_data_channel_unblocks_send(self) -> None:
+        try:
+            from open_gpt_voice.transports.webrtc import WebRTCTransport
+        except ImportError:  # pragma: no cover - aiortc is optional
+            self.skipTest("aiortc is not installed")
+
+        class Channel:
+            label = "oai-events"
+            readyState = "open"
+
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+
+            def on(self, event: str, handler) -> None:
+                return None
+
+            def send(self, data: str) -> None:
+                self.sent.append(data)
+
+        channel = Channel()
+        transport = WebRTCTransport(SimpleNamespace(on=lambda *args: None))
+        transport._on_datachannel(channel)
+
+        asyncio.run(transport.send_text('{"type":"session.started"}'))
+
+        self.assertEqual(channel.sent, ['{"type":"session.started"}'])
+
+
 class SidebandTests(unittest.TestCase):
     def test_subscribe_receives_broadcast(self) -> None:
         from open_gpt_voice.live.session import LiveSession

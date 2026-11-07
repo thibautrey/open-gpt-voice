@@ -61,9 +61,10 @@ pipeline, and output PCM is upsampled to 48 kHz for the outgoing track.
 - `session.started` is emitted once the session configuration is validated and
   the ports are built. Its payload advertises the resolved model, delegation
   settings, audio format, and voice.
-- `session.update` may change instructions, thinking, commentary, and voice, but
-  `model`, `audio`, and `delegation` are immutable after start
-  (`immutable_field_update`).
+- `session.update` accepts only `delegation.responses` settings; `model`,
+  `instructions`, `audio`, `input`, `store`, and `delegation.type` are immutable
+  after start (`immutable_field_update`). A successful update emits
+  `session.updated` and carries the originating `client_event_id`.
 - `session.close` ends the session. Duration limits and idle timeouts close it
   with `expired`.
 
@@ -147,8 +148,8 @@ PYTHONPATH=src python -m pytest -q
 ```
 
 `tests/test_webrtc_api.py` covers session configuration, the WebRTC endpoint,
-sideband attach, and event fan-out. The full suite currently passes with 94
-tests.
+sideband attach, event fan-out, the already-open data-channel race, and the
+Responses delegation relay. The full suite currently passes with 96 tests.
 
 ## Next step: Hermes plugin
 

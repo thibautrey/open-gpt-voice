@@ -95,11 +95,14 @@ class WebRTCTransport:
         self._tasks: set[asyncio.Task[Any]] = set()
         self._ice_complete = asyncio.Event()
         self.log = logger.bind(component="webrtc-transport")
-        self._pc.addTrack(self._audio_out)
         self._pc.on("datachannel", self._on_datachannel)
         self._pc.on("track", self._on_track)
         self._pc.on("icegatheringstatechange", self._on_ice_state)
         self._pc.on("connectionstatechange", self._on_connection_state)
+
+    def attach_output_track(self) -> None:
+        """Add the assistant audio track once the remote offer is known."""
+        self._pc.addTrack(self._audio_out)
 
     @classmethod
     async def create(
@@ -116,6 +119,8 @@ class WebRTCTransport:
         await peer_connection.setRemoteDescription(
             RTCSessionDescription(sdp=offer_sdp, type="offer")
         )
+        if "m=audio" in offer_sdp:
+            transport.attach_output_track()
         answer = await peer_connection.createAnswer()
         await peer_connection.setLocalDescription(answer)
         try:
@@ -176,7 +181,13 @@ class WebRTCTransport:
         channel.on("open", self._channel_open.set)
         channel.on("close", self._channel_open.clear)
         channel.on("message", self._on_message)
-        self.log.info("WebRTC data channel opened", label=getattr(channel, "label", None))
+        self.log.info(
+            "WebRTC data channel opened",
+            label=getattr(channel, "label", None),
+            ready_state=getattr(channel, "readyState", None),
+        )
+        if getattr(channel, "readyState", None) == "open":
+            self._channel_open.set()
         if getattr(channel, "label", None) != _DATA_CHANNEL_LABEL:
             self.log.warning(
                 "Unexpected data channel label; expected oai-events",

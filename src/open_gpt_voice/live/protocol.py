@@ -194,12 +194,23 @@ def _validate_update(data: Mapping[str, Any], event_id: str | None) -> None:
             )
     delegation = changed.get("delegation")
     if delegation is not None:
-        _fail(
-            "immutable_field_update",
-            "delegation cannot be changed after session.start",
-            "session.delegation",
-            event_id,
-        )
+        if not isinstance(delegation, dict):
+            _fail("invalid_value", "delegation must be an object", "session.delegation", event_id)
+        if "type" in delegation:
+            _fail(
+                "immutable_field_update",
+                "delegation.type cannot change after session.start",
+                "session.delegation.type",
+                event_id,
+            )
+        responses = delegation.get("responses")
+        if responses is not None and not isinstance(responses, dict):
+            _fail(
+                "invalid_value",
+                "delegation.responses must be an object",
+                "session.delegation.responses",
+                event_id,
+            )
 
 
 def _validate_append(data: Mapping[str, Any], event_id: str | None) -> None:

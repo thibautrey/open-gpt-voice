@@ -316,14 +316,16 @@ class LiveSession:
                 changed = event.data.get("session", event.data)
                 delegation = changed.get("delegation") if isinstance(changed, Mapping) else None
                 if isinstance(delegation, Mapping):
-                    requested = delegation.get("type", "client")
-                    if requested != self.state.delegation_mode:
+                    requested = delegation.get("type")
+                    if requested is not None and requested != self.state.delegation_mode:
                         await self._send_error(
                             "immutable_field_update",
                             "delegation.type cannot change after session.start",
                         )
                         return
-                    self.state.delegation_config = dict(delegation)
+                    merged = dict(self.state.delegation_config)
+                    merged.update(delegation)
+                    self.state.delegation_config = merged
                 await self._ack("session.updated", event)
                 return
             if event.type == "response.item.create":
