@@ -275,7 +275,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(started, "TTS should start before the talker finishes streaming")
         self.assertEqual(speaker.texts[0], "First sentence.")
         self.assertEqual(
-            "".join(event["text"] for event in websocket.sent if event["type"] == "session.output_transcript.delta"),
+            "".join(str(event["delta"]) for event in websocket.sent if event["type"] == "session.output_transcript.delta"),
             "First sentence. ",
         )
 
@@ -503,7 +503,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         followup_index = next(
             index for index, event in enumerate(websocket.sent)
             if event["type"] == "session.output_transcript.delta"
-            and event.get("text") == "I’ll proceed with that choice."
+            and event.get("delta") == "I’ll proceed with that choice."
         )
         self.assertLess(cancelled_index, followup_index)
         self.assertFalse(session._waiting_for_background_input)

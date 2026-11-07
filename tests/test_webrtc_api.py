@@ -229,6 +229,19 @@ class WebRTCTransportTests(unittest.TestCase):
 
         self.assertEqual(channel.sent, ['{"type":"session.started"}'])
 
+    def test_missing_data_channel_does_not_block_sideband_only_session(self) -> None:
+        try:
+            from open_gpt_voice.transports.webrtc import WebRTCTransport
+        except ImportError:  # pragma: no cover - aiortc is optional
+            self.skipTest("aiortc is not installed")
+
+        transport = WebRTCTransport(SimpleNamespace(on=lambda *args: None))
+
+        async def _send() -> None:
+            await asyncio.wait_for(transport.send_text('{"type":"session.started"}'), timeout=0.5)
+
+        asyncio.run(_send())
+
 
 class SidebandTests(unittest.TestCase):
     def test_subscribe_receives_broadcast(self) -> None:

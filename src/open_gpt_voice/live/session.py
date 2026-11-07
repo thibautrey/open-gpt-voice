@@ -231,8 +231,24 @@ class LiveSession:
             if not isinstance(message, Mapping):
                 continue
             role, content = message.get("role"), message.get("content")
-            if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
-                self.state.history.append(TranscriptTurn(role, content))
+            if role not in {"user", "assistant"}:
+                continue
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                parts: list[str] = []
+                for part in content:
+                    if (
+                        isinstance(part, Mapping)
+                        and part.get("type") in {"input_text", "output_text"}
+                        and isinstance(part.get("text"), str)
+                    ):
+                        parts.append(part["text"])
+                text = "".join(parts)
+            else:
+                continue
+            if text.strip():
+                self.state.history.append(TranscriptTurn(role, text))
         del self.state.history[:-_MAX_HISTORY_TURNS]
 
         self.state.started = True
@@ -428,7 +444,7 @@ class LiveSession:
                     ServerEvent(
                         "session.input_transcript.delta",
                         {
-                            "text": transcript.text,
+                            "delta": transcript.text,
                             "start_ms": transcript.start_ms,
                             "end_ms": min(transcript.end_ms, end_ms),
                         },
@@ -673,7 +689,16 @@ class LiveSession:
         if stream_reply is None:
             reply = await self.ports.talker.reply(request)
             self.log.info("LLM reply received", elapsed_ms=round((time.perf_counter() - started) * 1000), reply_chars=len(reply))
-            await self._send(ServerEvent("session.output_transcript.delta", {"text": reply}))
+            await self._send(
+                ServerEvent(
+                    "session.output_transcript.delta",
+                    {
+                        "delta": reply,
+                        "start_ms": self.state.output_audio_ms,
+                        "end_ms": self.state.output_audio_ms,
+                    },
+                )
+            )
             self._queue_speech(reply, transcript_sent=True)
             return reply
         fragments: list[str] = []
@@ -683,7 +708,16 @@ class LiveSession:
                 self.log.info("LLM first token received", elapsed_ms=round((time.perf_counter() - started) * 1000))
                 first_fragment = False
             fragments.append(fragment)
-            await self._send(ServerEvent("session.output_transcript.delta", {"text": fragment}))
+            await self._send(
+                ServerEvent(
+                    "session.output_transcript.delta",
+                    {
+                        "delta": fragment,
+                        "start_ms": self.state.output_audio_ms,
+                        "end_ms": self.state.output_audio_ms,
+                    },
+                )
+            )
             speech_buffer += fragment
             chunks, speech_buffer = _take_speech_chunks(speech_buffer)
             for chunk in chunks:
@@ -845,7 +879,16 @@ class LiveSession:
             cancellation: ThreadEvent | None = None
             try:
                 if not transcript_sent:
-                    await self._send(ServerEvent("session.output_transcript.delta", {"text": text}))
+                    await self._send(
+                        ServerEvent(
+                            "session.output_transcript.delta",
+                            {
+                                "delta": text,
+                                "start_ms": self.state.output_audio_ms,
+                                "end_ms": self.state.output_audio_ms,
+                            },
+                        )
+                    )
                 cancellation = ThreadEvent()
                 self._synthesis_cancel = cancellation
                 synthesis_started = time.perf_counter()

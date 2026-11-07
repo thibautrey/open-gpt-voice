@@ -160,8 +160,16 @@ class WebRTCTransport:
             self._audio_out.clear()
         if self._closed:
             return
-        await self._channel_open.wait()
-        if self._channel is None or self._channel.readyState != "open":
+        # Sideband-only clients (bighelp) never create a data channel: media
+        # carries audio and the sideband carries events, so a missing channel
+        # must not stall the session.
+        if self._channel is None:
+            return
+        try:
+            await asyncio.wait_for(self._channel_open.wait(), timeout=2)
+        except TimeoutError:
+            return
+        if self._channel.readyState != "open":
             return
         self._channel.send(data)
 

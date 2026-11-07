@@ -199,7 +199,7 @@ The session layer does not import Silero, Whisper, GLiNER, Laya, LM Studio, or S
 
 The session contract can be reached the way GPT-Live clients expect it:
 
-- `POST /v1/live/sessions` takes an SDP offer and returns an SDP answer. Events flow over the `oai-events` data channel; microphone audio arrives on the WebRTC audio track and generated speech leaves on the outgoing track.
+- `POST /v1/live/sessions` takes an SDP offer and returns an SDP answer. Events flow over the optional `oai-events` data channel or the sideband socket; microphone audio arrives on the WebRTC audio track and generated speech leaves on the outgoing track.
 - `WS /v1/live/sessions` remains available as a WebSocket-only transport.
 - `WS /v1/live/sessions/{id}/attach` attaches a server-side sideband to a running session.
 - `delegation.type` is `client` or `responses`; the latter calls an OpenAI-compatible `/v1/responses` endpoint and relays its stream as `response.event`.

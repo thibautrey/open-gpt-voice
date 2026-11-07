@@ -47,6 +47,33 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolError, "must be pcm16le"):
             parse_client_event(json.dumps(conflicting))
 
+    def test_audio_output_without_format_uses_fixed_contract(self) -> None:
+        event = parse_client_event(
+            json.dumps(
+                {
+                    "type": "session.start",
+                    "model": "gpt-live-1",
+                    "audio": {"output": {"voice": "marin"}},
+                }
+            )
+        )
+
+        self.assertEqual(event.data["audio"]["output"]["voice"], "marin")
+
+    def test_append_accepts_public_content_alias(self) -> None:
+        event = parse_client_event(
+            json.dumps(
+                {
+                    "type": "session.commentary.append",
+                    "event_id": "evt_append",
+                    "delegation_id": "item_1",
+                    "content": "Hello",
+                }
+            )
+        )
+
+        self.assertEqual(event.data["text"], "Hello")
+
     def test_immutable_update_includes_client_event_id(self) -> None:
         with self.assertRaises(ProtocolError) as raised:
             parse_client_event(

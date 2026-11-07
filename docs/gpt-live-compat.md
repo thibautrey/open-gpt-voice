@@ -37,8 +37,9 @@ The WebRTC request body is:
 }
 ```
 
-`audio.format` must be omitted for WebRTC: the format is negotiated in SDP. For
-the WebSocket transport, `audio.format` accepts either the GPT-Live shape
+`audio.format` is optional: when omitted, the fixed 24 kHz mono PCM16 contract is
+used. For WebRTC it is normally omitted because the format is negotiated in SDP.
+For the WebSocket transport it accepts either the GPT-Live shape
 `{"type": "audio/pcm", "rate": 24000}` or the legacy
 `{"encoding": "pcm16le", "sample_rate": 24000, "channels": 1}`.
 
@@ -51,10 +52,12 @@ The response is:
 }
 ```
 
-The data channel is named `oai-events`; server events are JSON objects with the
-same `type` field as the WebSocket transport. Input audio arrives on the remote
-audio track as 48 kHz Opus, is downsampled to 24 kHz PCM16 for the VAD/ASR
-pipeline, and output PCM is upsampled to 48 kHz for the outgoing track.
+The data channel is optional and named `oai-events`. A client that only uses the
+sideband socket (`WS /v1/live/sessions/{id}/attach`) can omit it entirely: events
+are fanned out to the sideband, and server-to-channel sends are skipped when no
+channel exists. Input audio arrives on the remote audio track as 48 kHz Opus, is
+downsampled to 24 kHz PCM16 for the VAD/ASR pipeline, and output PCM is upsampled
+to 48 kHz for the outgoing track.
 
 ## Session lifecycle
 
@@ -65,6 +68,9 @@ pipeline, and output PCM is upsampled to 48 kHz for the outgoing track.
   `instructions`, `audio`, `input`, `store`, and `delegation.type` are immutable
   after start (`immutable_field_update`). A successful update emits
   `session.updated` and carries the originating `client_event_id`.
+- `session.thinking.append`, `session.commentary.append` and
+  `session.instructions.append` accept the public GPT-Live `content` field (or
+  the legacy `text` alias); `commentary.append` is spoken.
 - `session.close` ends the session. Duration limits and idle timeouts close it
   with `expired`.
 
@@ -148,8 +154,9 @@ PYTHONPATH=src python -m pytest -q
 ```
 
 `tests/test_webrtc_api.py` covers session configuration, the WebRTC endpoint,
-sideband attach, event fan-out, the already-open data-channel race, and the
-Responses delegation relay. The full suite currently passes with 96 tests.
+sideband attach, event fan-out, the already-open data-channel race, the
+sideband-only (no data channel) path, and the Responses delegation relay. The
+full suite currently passes with 99 tests.
 
 ## Next step: Hermes plugin
 

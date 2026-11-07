@@ -117,6 +117,8 @@ def parse_client_event(raw: str | bytes) -> ClientEvent:
         _validate_audio(data, event_id)
     elif event_type in APPEND_EVENTS:
         _validate_append(data, event_id)
+        if "text" not in data and isinstance(data.get("content"), str):
+            data["text"] = data["content"]
 
     return ClientEvent(event_type, event_id, data)
 
@@ -214,9 +216,9 @@ def _validate_update(data: Mapping[str, Any], event_id: str | None) -> None:
 
 
 def _validate_append(data: Mapping[str, Any], event_id: str | None) -> None:
-    text = data.get("text")
+    text = data.get("text", data.get("content"))
     if not isinstance(text, str) or not text.strip():
-        _fail("invalid_value", "text must be a non-empty string", "text", event_id)
+        _fail("invalid_value", "text or content must be a non-empty string", "text", event_id)
     if len(text.split()) > 500:
         _fail("invalid_value", "text must contain at most 500 tokens", "text", event_id)
     delegation_id = data.get("delegation_id")
@@ -268,7 +270,7 @@ def _validate_audio_format(audio: Any, event_id: str | None) -> None:
             if audio_format[key] != required:
                 _fail("invalid_value", f"audio.format.{key} must be {required}", f"audio.format.{key}", event_id)
     if not found_format:
-        _fail("invalid_value", "audio.format is required when audio is supplied", "audio.format", event_id)
+        return
 
 
 def _normalized_audio_format(audio: Any) -> dict[str, Any]:
