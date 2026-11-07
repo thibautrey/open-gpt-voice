@@ -158,9 +158,15 @@ sideband attach, event fan-out, the already-open data-channel race, the
 sideband-only (no data channel) path, and the Responses delegation relay. The
 full suite currently passes with 99 tests.
 
-## Next step: Hermes plugin
+## Hermes plugin
 
-The intended consumer is a Hermes plugin that exposes this endpoint to bighelp as
-a live voice model, mirroring how ChatGPT's live mode is surfaced. That plugin is
-not part of this repository yet; it will speak this contract over WebRTC and
-reuse the same `session.start` / `session.started` / delegation semantics.
+The consumer is the `gpt-live-local` Hermes plugin (installed at
+`~/.hermes/plugins/gpt-live-local`, not part of this repository). It takes over
+bighelp's "API key" live slot on the host and points it at this server, reusing
+the public GPT-Live WebRTC offer/answer and sideband protocol. Configure it with:
+
+```bash
+hermes config set plugins.entries.gpt-live-local.settings.url "http://127.0.0.1:8099"
+```
+
+Its `gpt_live_local` tool reports the bridge state and probes `/health`.
