@@ -19,9 +19,21 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.port, 8000)
         self.assertEqual(settings.vad_pause_ms, 700)
         self.assertEqual(settings.supertonic_voice_map, {"marin": "F1"})
+        self.assertEqual(settings.tts_voice, "marin")
         self.assertEqual(settings.router_provider, "gliner")
         self.assertEqual(settings.gliner_task_threshold, 0.7)
         self.assertEqual(settings.delegation_db_path, ".opengpt-voice-delegations.sqlite3")
+
+    def test_tts_voice_is_configurable(self) -> None:
+        settings = Settings.from_env({**VALID_ENV, "OPENGPT_VOICE_TTS_VOICE": "ff_siwis"})
+
+        self.assertEqual(settings.tts_voice, "ff_siwis")
+
+    def test_empty_tts_voice_is_rejected(self) -> None:
+        environment = {**VALID_ENV, "OPENGPT_VOICE_TTS_VOICE": "  "}
+
+        with self.assertRaisesRegex(ConfigurationError, "OPENGPT_VOICE_TTS_VOICE"):
+            Settings.from_env(environment)
 
     def test_bearer_token_is_optional(self) -> None:
         settings = Settings.from_env({

@@ -2,7 +2,12 @@ import base64
 import json
 import unittest
 
-from open_gpt_voice.live.protocol import ProtocolError, authenticate, parse_client_event
+from open_gpt_voice.live.protocol import (
+    ProtocolError,
+    authenticate,
+    parse_client_event,
+    validate_session_config,
+)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -59,6 +64,26 @@ class ProtocolTests(unittest.TestCase):
         )
 
         self.assertEqual(event.data["audio"]["output"]["voice"], "marin")
+
+    def test_session_config_uses_configured_default_voice(self) -> None:
+        resolved = validate_session_config(
+            {"model": "gpt-live-1", "delegation": {"type": "client"}},
+            default_voice="ff_siwis",
+        )
+
+        self.assertEqual(resolved["voice"], "ff_siwis")
+
+    def test_session_config_prefers_explicit_voice(self) -> None:
+        resolved = validate_session_config(
+            {
+                "model": "gpt-live-1",
+                "delegation": {"type": "client"},
+                "audio": {"output": {"voice": "marin"}},
+            },
+            default_voice="ff_siwis",
+        )
+
+        self.assertEqual(resolved["voice"], "marin")
 
     def test_append_accepts_public_content_alias(self) -> None:
         event = parse_client_event(

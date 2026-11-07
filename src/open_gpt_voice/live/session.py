@@ -215,7 +215,7 @@ class LiveSession:
 
     async def _apply_start(self, data: Mapping[str, Any], event_id: str | None) -> None:
         """Resolve startup configuration, build ports, and emit session.started."""
-        resolved = validate_session_config(data, event_id)
+        resolved = validate_session_config(data, event_id, self.settings.tts_voice)
         try:
             self.ports = self.port_factory()
         except Exception:

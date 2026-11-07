@@ -139,7 +139,7 @@ def _validate_start(data: Mapping[str, Any], event_id: str | None) -> None:
 
 
 def validate_session_config(
-    data: Mapping[str, Any], event_id: str | None = None
+    data: Mapping[str, Any], event_id: str | None = None, default_voice: str = "marin"
 ) -> dict[str, Any]:
     """Validate a startup configuration and return its normalized fields.
 
@@ -178,7 +178,7 @@ def validate_session_config(
         "audio_format": _normalized_audio_format(data.get("audio")),
         "instructions": instructions or "",
         "history": history or [],
-        "voice": _voice(data),
+        "voice": _voice(data, default_voice),
     }
 
 
@@ -278,7 +278,7 @@ def _normalized_audio_format(audio: Any) -> dict[str, Any]:
     return {"type": "audio/pcm", "rate": 24000}
 
 
-def _voice(data: Mapping[str, Any]) -> str:
+def _voice(data: Mapping[str, Any], default: str = "marin") -> str:
     """Resolve the requested voice from either supported payload shape."""
     audio = data.get("audio")
     if isinstance(audio, dict):
@@ -288,7 +288,7 @@ def _voice(data: Mapping[str, Any]) -> str:
     voice = data.get("voice")
     if isinstance(voice, str) and voice:
         return voice
-    return "marin"
+    return default
 
 
 def _fail(code: str, message: str, param: str, event_id: str | None) -> None:

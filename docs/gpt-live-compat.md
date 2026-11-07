@@ -117,6 +117,7 @@ but the layer is model-agnostic on purpose.
 | `OPENGPT_VOICE_TTS_PROVIDER` | `supertonic` | `supertonic` or `openai` |
 | `OPENGPT_VOICE_TTS_BASE_URL` | `http://127.0.0.1:8880/v1` | OpenAI-compatible TTS root |
 | `OPENGPT_VOICE_TTS_MODEL` | `kokoro` | TTS model name |
+| `OPENGPT_VOICE_TTS_VOICE` | `marin` | Default voice when the session does not request one |
 | `OPENGPT_VOICE_TTS_API_KEY` | unset | Bearer token for TTS |
 | `OPENGPT_VOICE_TTS_RESPONSE_FORMAT` | `wav` | `wav` or `pcm` |
 | `OPENGPT_VOICE_TURN_PROVIDER` | `vad` | `vad` or `http` |

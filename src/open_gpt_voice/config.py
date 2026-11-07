@@ -39,6 +39,7 @@ class Settings:
     tts_provider: str = "supertonic"
     tts_base_url: str = "http://127.0.0.1:8880/v1"
     tts_model: str = "kokoro"
+    tts_voice: str = "marin"
     tts_api_key: str | None = None
     tts_response_format: str = "wav"
     turn_provider: str = "vad"
@@ -88,6 +89,7 @@ class Settings:
             tts_provider=raw.get("tts_provider", defaults.tts_provider),
             tts_base_url=raw.get("tts_base_url", defaults.tts_base_url),
             tts_model=raw.get("tts_model", defaults.tts_model),
+            tts_voice=raw.get("tts_voice", defaults.tts_voice),
             tts_api_key=raw.get("tts_api_key") or None,
             tts_response_format=raw.get("tts_response_format", defaults.tts_response_format),
             turn_provider=raw.get("turn_provider", defaults.turn_provider),
@@ -119,6 +121,8 @@ class Settings:
             raise ConfigurationError("OPENGPT_VOICE_TURN_PROVIDER must be vad or http")
         if self.delegation_mode not in {"client", "responses"}:
             raise ConfigurationError("OPENGPT_VOICE_DELEGATION_MODE must be client or responses")
+        if not self.tts_voice.strip():
+            raise ConfigurationError("OPENGPT_VOICE_TTS_VOICE must not be empty")
         required = {
             "OPENGPT_VOICE_SILERO_MODEL_PATH": self.silero_model_path,
         }
